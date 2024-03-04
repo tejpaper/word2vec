@@ -1,0 +1,5 @@
+.idea
+.ipynb_checkpoints
+**/__pycache__/
+docs
+logs/checkpoints/*.pth
