@@ -1,39 +1,61 @@
-from .constants import DEVICE, SKIP_GRAM_SIZE, NEGATIVE_S_NUM, VOCAB_SIZE, UNK_TOKEN
-
-import json
-import random
 import itertools
-
+import json
 from collections import Counter, OrderedDict
 from string import whitespace, digits, punctuation
 
 import torch
-
-from torch.utils.data import Dataset
+from torch.utils.data import TensorDataset
 from torchtext.data import get_tokenizer, custom_replace
 from torchtext.vocab import vocab
 
-from typing import Generator, Tuple
+from tqdm.autonotebook import tqdm
 
 
-class DataSet(Dataset):
-    def __init__(self, json_file: str,
-                 initial_seed: int = None,
-                 device: torch.device = DEVICE,
-                 skip_gram_size: int = SKIP_GRAM_SIZE,
-                 negative_samples_num: int = NEGATIVE_S_NUM,
-                 vocab_size: int = VOCAB_SIZE,
-                 unk_token: str = UNK_TOKEN,
-                 is_lower: bool = True,
-                 is_digits: bool = True,
-                 is_punctuation: bool = False):
+def load_amazon_fashion(path: str, verbose: bool = True) -> list[str]:
+    with open(path) as file:
+        samples = [review.get('reviewText', '') for review in
+                   tqdm(list(map(json.loads, file)), disable=not verbose, desc='Loading dataset')]
+    samples = list(itertools.chain(*map(lambda x: x.split('.'), samples)))
+    samples = [sample for sample in samples if sample]
+    return samples
 
-        self.device = device
+
+class Dataset(TensorDataset):
+    def __init__(self,
+                 samples: list[str],
+                 skip_gram_size: int,
+                 negative_samples_num: int,
+                 vocab_size: int,
+                 unk_token: str,
+                 is_lower: bool,
+                 are_digits: bool,
+                 is_punctuation: bool,
+                 verbose: bool = True,
+                 ) -> None:
+
+        self.samples = samples
         self.skip_grams = set(range(-skip_gram_size // 2 + 1, skip_gram_size // 2 + 1)) - {0}
         self.negative_samples_num = negative_samples_num
+        self.unk_token = unk_token
 
+        self.unk_index = None
+        self.frequencies = None
+        self.vocabulary = None
+        self._prepare_seq_dataset(vocab_size, is_lower, are_digits, is_punctuation, verbose)
+        input_indexes, target_indexes = self._create_blocks(verbose)
+
+        super().__init__(input_indexes, target_indexes)
+
+    def _prepare_seq_dataset(self,
+                             vocab_size: int,
+                             is_lower: bool,
+                             are_digits: bool,
+                             is_punctuation: bool,
+                             verbose: bool,
+                             ) -> None:
         replace_patterns = {(char, ' ') for char in whitespace}
-        if not is_digits:
+
+        if not are_digits:
             replace_patterns |= {(char, '') for char in digits}
         if not is_punctuation:
             replace_patterns |= {(fr'\{char}', '') for char in punctuation}
@@ -41,34 +63,29 @@ class DataSet(Dataset):
         transforms = custom_replace(replace_patterns)
         tokenizer = get_tokenizer((None, 'basic_english')[is_lower])
 
-        self.quotes = set()
+        self.samples = [tokenizer(sample) for sample in tqdm(
+            transforms(self.samples),
+            total=len(self.samples),
+            disable=not verbose,
+            desc='Preparing dataset')]
+        self.samples = [sample for sample in self.samples if len(sample) > 1]
 
-        with open(json_file) as file:
-            for review in map(json.loads, file):
-                sentences = review.get('reviewText', '').split('.')
-                sentences = transforms(sentences)
+        counter = Counter(itertools.chain(*self.samples))
 
-                self.quotes |= set((*tokenizer(sentence),) for sentence in sentences)
-        self.quotes = [sentence for sentence in self.quotes if len(sentence) > 1]
-        self.shuffle(initial_seed)
+        tokens_total = sum(map(lambda x: x[1], counter.most_common()))
+        counter = counter.most_common(vocab_size - 1)
 
-        counter = Counter(itertools.chain(*self.quotes))
-        counter = sorted(counter.items(), key=lambda x: x[1], reverse=True)
-
-        tokens_num = sum([freq for _, freq in counter])
-        counter = counter[:vocab_size - 1]
-
-        in_vocab_tokens_num = sum([freq for _, freq in counter])
-        unk_freq = tokens_num - in_vocab_tokens_num
+        in_vocab_total = sum(map(lambda x: x[1], counter))
+        unk_total = tokens_total - in_vocab_total
 
         for i, (_, freq) in enumerate(counter):
-            if unk_freq > freq:
+            if unk_total > freq:
                 self.unk_index = i
                 break
         else:
             self.unk_index = vocab_size - 1
 
-        counter.insert(self.unk_index, (unk_token, unk_freq))
+        counter.insert(self.unk_index, (self.unk_token, unk_total))
 
         self.frequencies = torch.tensor([freq for _, freq in counter])
         self.frequencies = self.frequencies ** (3 / 4)
@@ -77,33 +94,28 @@ class DataSet(Dataset):
         self.vocabulary = vocab(OrderedDict(counter))
         self.vocabulary.set_default_index(self.unk_index)
 
-    def shuffle(self, seed: int = None):
-        self.quotes.sort()
-        random.seed(seed)
-        random.shuffle(self.quotes)
+    def _create_blocks(self, verbose: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        input_indexes = list()
+        target_indexes = list()
 
-    def __len__(self) -> int:
-        return len(self.quotes)
+        for sample in tqdm(self.samples, disable=not verbose, desc='Creating blocks'):
+            encoded = [self.vocabulary[token] for token in sample]
+            tokens_num = len(encoded)
 
-    def __getitem__(self, index: int) -> Generator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], None, None]:
-        sentence = [torch.tensor(self.vocabulary[token], device=self.device) for token in self.quotes[index]]
+            for i, x_index in enumerate(encoded):
+                if x_index == self.unk_index:
+                    continue
 
-        for i, x_index in enumerate(sentence):
-            if x_index == self.unk_index:
-                continue
+                for shift in self.skip_grams:
+                    j = i + shift
+                    if 0 <= j < tokens_num and encoded[j] != self.unk_index:
+                        input_indexes.append(x_index)
+                        target_indexes.append(encoded[j])
 
-            targets_indices = list()
+        return torch.tensor(input_indexes), torch.tensor(target_indexes)
 
-            for j, t_index in enumerate(sentence):
-                if i - j in self.skip_grams and t_index != self.unk_index:
-                    targets_indices.append(t_index)
-
-            targets_num = len(targets_indices)
-
-            if not targets_num:
-                continue
-
-            targets_indices = torch.tensor(targets_indices, device=self.device)
-            negative_indices = self.frequencies.multinomial(self.negative_samples_num * targets_num).to(self.device)
-
-            yield x_index, targets_indices, negative_indices
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        input_idx, target_idx = super().__getitem__(index)
+        output_indexes = self.frequencies.multinomial(self.negative_samples_num + 1)
+        output_indexes[0] = target_idx
+        return input_idx, output_indexes

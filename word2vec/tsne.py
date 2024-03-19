@@ -1,50 +1,46 @@
-from .constants import PATH2CLUSTERS, RANDOM_SEED
-from .embedding import Vector
+from word2vec.embedding import Word2Vec
 
-import json
 import numpy as np
-import matplotlib.pyplot as plt
-
 from sklearn.manifold import TSNE
-from PIL import Image
-from io import BytesIO
+
+import matplotlib.pyplot as plt
+import matplotlib.patheffects as pe
 
 
-def tsne(vector: Vector,
-         perplexity: int = 30,
+def tsne(word2vec: Word2Vec,
+         perplexity: int = 40,
          iterations_num: int = 1000,
-         is_random: bool = True,
-         resolution: int = 1500,
-         font_size: float = 0.5
-         ) -> Image.Image:
+         random_seed: int | None = 42,
+         font_size: float = 0.5,
+         colors_mapping: dict[str, list[str]] | None = None,  # word : color
+         ) -> tuple[plt.Figure, plt.Axes]:
 
-    random_seed = (RANDOM_SEED, None)[is_random]
-    tsne_calc = TSNE(2, perplexity=perplexity, n_iter=iterations_num, random_state=random_seed)
-    crds = tsne_calc.fit_transform(vector.embedding.weight)
+    tsne_calc = TSNE(n_components=2,
+                     perplexity=perplexity,
+                     n_iter=iterations_num,
+                     metric='cosine',
+                     random_state=random_seed)
+    crds = tsne_calc.fit_transform(word2vec.weight.cpu())
 
-    _, ax = plt.subplots(dpi=resolution, frameon=False)
-    ax.set_facecolor('#2b2b2b')
-    plt.axis('off')
+    fig, ax = plt.subplots(frameon=False)
+    ax.axis('off')
 
     limits = np.vstack((crds.max(0), crds.min(0)))[::-1].T
-    plt.xlim(limits[0])
-    plt.ylim(limits[1])
+    ax.set_xlim(limits[0])
+    ax.set_ylim(limits[1])
 
-    with open(PATH2CLUSTERS) as file:
-        clusters, colors = json.load(file).values()
+    if colors_mapping is None:
+        colors_mapping = dict()
 
-    for word, (x, y) in zip(vector.vocabulary.get_itos(), crds):
-        for tag, cluster in clusters.items():
-            if word in cluster:
-                color = colors[tag]
-                break
+    for word, (x, y) in zip(word2vec.vocabulary.get_itos(), crds):
+        color = colors_mapping.get(word, 'white')
+
+        if color == 'white':
+            path_effects = [pe.withStroke(linewidth=font_size / 5, foreground='black')]
         else:
-            color = ('#e3e3e2', "#defb9b")[word.isdigit()]
-        plt.text(x, y, word, color=color, size=font_size)
+            path_effects = list()
 
-    buf = BytesIO()
-    plt.savefig(buf)
-    buf.seek(0)
+        ax.text(x, y, word, color=color, size=font_size, path_effects=path_effects)
+
     plt.close()
-
-    return Image.open(buf)
+    return fig, ax
